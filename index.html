@@ -435,7 +435,7 @@ window.addEventListener('resize', resize); resize();
 const DIRS = [{ x: -1, y: 0, a: Math.PI }, { x: 0, y: -1, a: -Math.PI / 2 }];
 const SLAB = 0.32;
 // low grip = the car slides (drifts) through turns
-const TUNE = { turn: 6.5, grip: 3.6, v0: 5.2, vAdd: 3.2, hw: 1.2 };
+const TUNE = { turn: 6.5, grip: 3.6, v0: 6.25, vAdd: 1.9, hw: 1.2 };
 const baseSpeed = d => TUNE.v0 + TUNE.vAdd * (1 - Math.exp(-d / 900));
 
 // Each stretch of road gets its own colour/pattern; it switches sharply at a corner.
@@ -452,7 +452,7 @@ const THEMES = [
 let coinsDirty = false;
 let segs, car, cam, dist, pts, bonus, runCoins, curSeg, power, driftT, skids, parts, floats;
 let fallT, fallFromMenu, fallFront, fallGap, lastSkid, invuln, playTime, time = 0, respawnT = 0, airT = 0;
-let straightMode = false;
+let straightMode = false, openEnds = [], forceHw = 0;
 let themeIdx = 0, pendingGap = 0, secType = 'normal', secLeft = 0;
 let state = 'menu';
 const GRAV = 14;
@@ -503,9 +503,82 @@ function sectionPiece(type, n, k, last) {
   return { len, hw };
 }
 
+// Work out a piece's footprint and sample points from its ends (extA behind the start, extB past the end).
+function segGeom(seg) {
+  const D = DIRS[seg.dir], a = seg.a, b = seg.b, hw = seg.hw;
+  const p0 = { x: a.x - D.x * seg.extA, y: a.y - D.y * seg.extA }, p1 = { x: b.x + D.x * seg.extB, y: b.y + D.y * seg.extB };
+  seg.r = D.x !== 0
+    ? { x0: Math.min(p0.x, p1.x), x1: Math.max(p0.x, p1.x), y0: a.y - hw, y1: a.y + hw }
+    : { x0: a.x - hw, x1: a.x + hw, y0: Math.min(p0.y, p1.y), y1: Math.max(p0.y, p1.y) };
+  seg.uA = -seg.extA; seg.uB = seg.len + seg.extB;
+  // sample points along the piece (more where the road bends up and down)
+  const us = [seg.uA, seg.uB];
+  for (const bp of seg.bumps) for (let i = 0; i <= 14; i++) us.push(bp.u0 + (bp.u1 - bp.u0) * i / 14);
+  if (seg.ramp) us.push(seg.len - RAMP_LEN, seg.len - RAMP_LEN * 0.5);
+  seg.us = [...new Set(us)].filter(u => u >= seg.uA && u <= seg.uB).sort((p, q) => p - q);
+}
+
+function newPiece(a, dir, len, hw, extra = {}) {
+  const D = DIRS[dir];
+  return Object.assign({ a: { x: a.x, y: a.y }, b: { x: a.x + D.x * len, y: a.y + D.y * len }, dir, len, hw, theme: themeIdx,
+    coins: [], pow: null, bumps: [], ramp: false, flat: true, landing: false, extA: 0, extB: 0 }, extra);
+}
+
+// Add a piece after the given predecessors. At a turn, each piece reaches exactly as far as the
+// other piece is wide, so corners join cleanly with no stubs of colour poking out.
+function pushPiece(seg, preds) {
+  const n = segs.length;
+  if (!preds.length) seg.extA = seg.hw;
+  else if (!seg.landing) seg.extA = Math.max(0, ...preds.map(i => segs[i].dir !== seg.dir ? segs[i].hw : 0));
+  for (const i of preds) {
+    const p = segs[i];
+    if (p.next == null) p.next = n; else p.next2 = n;
+    if (!p.ramp && p.dir !== seg.dir) { p.extB = Math.max(p.extB, seg.hw); segGeom(p); }
+  }
+  segGeom(seg);
+  segs.push(seg);
+  return n;
+}
+
+function placeCoins(seg, from, every = 0.75, max = 5, offset = 0) {
+  const D = DIRS[seg.dir], px = -D.y, py = D.x;
+  for (let i = 0, t = from; i < max && t <= seg.len - 0.5; i++, t += every)
+    seg.coins.push({ x: seg.a.x + D.x * t + px * offset, y: seg.a.y + D.y * t + py * offset, z: segHeight(seg, t), got: false });
+}
+function placePow(seg, t) {
+  const D = DIRS[seg.dir];
+  seg.pow = { x: seg.a.x + D.x * t, y: seg.a.y + D.y * t, z: segHeight(seg, t), type: ['shield', 'slow', 'magnet', 'double'][Math.random() * 4 | 0], got: false };
+}
+
+// A split: the road forks into two routes around a hole and they join up again.
+// Route A goes left then right, route B goes right then left; both meet at the same corner.
+function addFork() {
+  const P = openEnds[0], last = segs[P];
+  const hwF = Math.max(last.hw, rand(1.3, 1.55) * TUNE.hw);
+  const la = rand(2 * hwF + 2.6, 2 * hwF + 5), lb = rand(2 * hwF + 2.6, 2 * hwF + 5);
+  const start = last.b;
+  const A1 = newPiece(start, 0, la, hwF, { branch: true }), iA1 = pushPiece(A1, [P]);
+  const A2 = newPiece(A1.b, 1, lb, hwF, { branch: true }), iA2 = pushPiece(A2, [iA1]);
+  const B1 = newPiece(start, 1, lb, hwF, { branch: true }), iB1 = pushPiece(B1, [P]);
+  const B2 = newPiece(B1.b, 0, la, hwF, { branch: true }), iB2 = pushPiece(B2, [iB1]);
+  // one route pays coins, the other may hide a power-up
+  const [rich, other] = Math.random() < 0.5 ? [[A1, A2], [B1, B2]] : [[B1, B2], [A1, A2]];
+  for (const s of rich) placeCoins(s, 1.0, 0.7, 4);
+  if (Math.random() < 0.6) placePow(other[0], other[0].len * 0.55);
+  openEnds = [iA2, iB2];
+  forceHw = hwF;
+}
+
 function addSeg() {
   const n = segs.length, last = segs[n - 1];
   const k = Math.min(1, n / 220); // 0 → 1 difficulty
+
+  if (!straightMode && pendingGap === 0 && openEnds.length === 1 && n > 10 && last && !last.ramp && !last.landing && !last.branch
+      && last.len >= 3 && (secType === 'normal' || secType === 'wide' || secType === 'sweep') && Math.random() < 0.08 + 0.05 * k) {
+    addFork();
+    return;
+  }
+
   let dir = last && !straightMode ? 1 - last.dir : 0;
   let a = last ? { x: last.b.x, y: last.b.y } : { x: 1.4, y: 0 };
   let len, hw, landing = false;
@@ -524,14 +597,13 @@ function addSeg() {
     if (secLeft-- <= 0) nextSection(k);
     ({ len, hw } = sectionPiece(secType, n, k, last));
   }
-  const D = DIRS[dir];
-  const b = { x: a.x + D.x * len, y: a.y + D.y * len };
-  const seg = { a, b, dir, len, hw, theme: themeIdx, coins: [], pow: null, bumps: [], ramp: false, flat: true, landing, extA: landing ? 0 : hw, extB: hw };
+  if (forceHw) { hw = forceHw; len = Math.max(len, 3); forceHw = 0; } // the piece after a split matches its width
+  const seg = newPiece(a, dir, len, hw, { landing });
 
   // features
-  const featureOk = !straightMode && !landing && (secType === 'normal' || secType === 'wide' || secType === 'sweep');
+  const featureOk = !straightMode && !landing && !(last && last.branch) && (secType === 'normal' || secType === 'wide' || secType === 'sweep');
   if (featureOk && n > 8 && len >= 6.5 && !last.landing && Math.random() < 0.08 + 0.06 * k) {
-    seg.ramp = true; seg.flat = false; seg.extB = 0;
+    seg.ramp = true; seg.flat = false;
   } else if (featureOk && n > 3 && len >= 6.6 && Math.random() < 0.3 + 0.17 * k) {
     const two = len >= 10.5 && Math.random() < 0.5;
     const span = two ? Math.min(rand(2.4, 3.2), (len - 4.4) / 2) : Math.min(rand(2.4, 3.4), len - 4.0);
@@ -542,42 +614,20 @@ function addSeg() {
   }
   pendingGap = seg.ramp ? rand(1.0, 1.4) : 0;
 
-  const p0 = { x: a.x - D.x * seg.extA, y: a.y - D.y * seg.extA }, p1 = { x: b.x + D.x * seg.extB, y: b.y + D.y * seg.extB };
-  seg.r = D.x !== 0
-    ? { x0: Math.min(p0.x, p1.x), x1: Math.max(p0.x, p1.x), y0: a.y - hw, y1: a.y + hw }
-    : { x0: a.x - hw, x1: a.x + hw, y0: Math.min(p0.y, p1.y), y1: Math.max(p0.y, p1.y) };
-  seg.uA = -seg.extA; seg.uB = len + seg.extB;
-  // sample points along the segment (more where the road bends up and down)
-  const us = [seg.uA, seg.uB];
-  for (const bp of seg.bumps) for (let i = 0; i <= 14; i++) us.push(bp.u0 + (bp.u1 - bp.u0) * i / 14);
-  if (seg.ramp) us.push(len - RAMP_LEN, len - RAMP_LEN * 0.5);
-  seg.us = [...new Set(us)].filter(u => u >= seg.uA && u <= seg.uB).sort((p, q) => p - q);
-
   // coins over the gap, in an arc the car will fly through
   if (landing) {
-    const gap = Math.hypot(a.x - last.b.x, a.y - last.b.y);
+    const D = DIRS[dir], gap = Math.hypot(a.x - last.b.x, a.y - last.b.y);
     for (const f of [0.15, 0.5, 0.85]) seg.coins.push({ x: last.b.x + D.x * gap * f, y: last.b.y + D.y * gap * f, z: RAMP_H + 0.15 + Math.sin(f * Math.PI) * 0.35, got: false, air: true });
   }
   if (n > 1 && len >= 3 && !seg.ramp && !straightMode) {
-    const px = -D.y, py = D.x; // perpendicular
-    if (n > 6 && Math.random() < 0.08) {
-      const t = len * 0.55;
-      seg.pow = { x: a.x + D.x * t, y: a.y + D.y * t, z: segHeight(seg, t), type: ['shield', 'slow', 'magnet', 'double'][Math.random() * 4 | 0], got: false };
-    } else if (Math.random() < 0.5) {
-      const cnt = Math.min(5, Math.floor((len - 1.2) / 0.75));
-      const off = Math.random() < 0.5 ? rand(-hw * 0.55, hw * 0.55) : 0;
-      for (let i = 0; i < cnt; i++) {
-        const t = (landing ? 2.5 : 1.2) + i * 0.75;
-        if (t > len - 0.5) break;
-        seg.coins.push({ x: a.x + D.x * t + px * off, y: a.y + D.y * t + py * off, z: segHeight(seg, t), got: false });
-      }
-    }
+    if (n > 6 && Math.random() < 0.08) placePow(seg, len * 0.55);
+    else if (Math.random() < 0.5) placeCoins(seg, landing ? 2.5 : 1.2, 0.75, 5, Math.random() < 0.5 ? rand(-hw * 0.55, hw * 0.55) : 0);
   }
-  segs.push(seg);
+  openEnds = [pushPiece(seg, openEnds)];
 }
 
 function resetWorld(menu = false) {
-  straightMode = menu;
+  straightMode = menu; openEnds = []; forceHw = 0;
   segs = []; themeIdx = 0; pendingGap = 0; secType = 'normal'; secLeft = 5;
   for (let i = 0; i < 34; i++) addSeg();
   car = { x: 0, y: 0, z: 0, vz: 0, h: Math.PI, v: Math.PI, speed: 0, spin: 0, spinDir: 1, air: false, gh: 0 };
@@ -599,7 +649,7 @@ function findSeg(x, y) {
 // Autopilot used for the menu background
 function aiHold() {
   if (straightMode) return false;
-  const s = segs[curSeg], D = DIRS[s.dir], nxt = segs[curSeg + 1];
+  const s = segs[curSeg], D = DIRS[s.dir], nxt = segs[s.next ?? curSeg + 1];
   const rem = (s.b.x - car.x) * D.x + (s.b.y - car.y) * D.y;
   if (rem < car.speed * (1.6 / TUNE.grip) + 0.3) return nxt.dir === 1;
   return s.dir === 1;
@@ -632,7 +682,7 @@ function rescue() {
   let idx = -1, fallback = -1;
   for (let i = curSeg + 1; i < curSeg + 60 && idx < 0; i++) {
     const c = segs[i];
-    if (c.dir !== 0 || c.ramp) continue;
+    if (c.dir !== 0 || c.ramp || c.branch) continue;
     if (fallback < 0) fallback = i;
     if (c.len >= 6 && !c.bumps.length) idx = i;
   }
@@ -903,8 +953,11 @@ function draw() {
   const carSlot = !falling ? null : fallGap ? curSeg : fallFront ? null : Infinity;
   if (carSlot === Infinity) drawCarWorld();
 
-  // later segments are always farther away, so paint far → near
-  for (let i = i1 - 1; i >= i0; i--) {
+  // paint road pieces far → near (splits mean index order isn't always depth order)
+  const order = [];
+  for (let i = i0; i < i1; i++) { const r = segs[i].r; order.push([toCam((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2, 0)[2], i]); }
+  order.sort((p, q) => q[0] - p[0]);
+  for (const [, i] of order) {
     if (carSlot === i) drawCarWorld();
     drawSides(segs[i]); drawTop(segs[i]);
   }
