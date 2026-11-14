@@ -421,8 +421,8 @@ function drawCar(c, proj, eye, px, py, ang, def, z0 = 0, time = 0) {
     for (const s of [-1, 1]) box(0.4 * Lx, s * Wd * 0.64, 0.045, 0.06, 0.19, 0.222, '#fff7c2', '#ffffff');
     // glasshouse with a fastback roof sloping down to the tail
     const glass = def.glass;
-    extrude(sc([[-0.45, 0.24], [0.15, 0.24], [0.07, 0.32], [-0.01, 0.365], [-0.1, 0.375], [-0.2, 0.355], [-0.32, 0.3]]), Wd * 0.8, glass,
-      { 1: glass, 2: glass, 3: def.roof, 4: def.roof, 5: glass, 6: glass, side: glass });
+    extrude(sc([[-0.45, 0.24], [0.15, 0.24], [0.08, 0.36], [0.02, 0.44], [-0.08, 0.46], [-0.24, 0.45], [-0.36, 0.38], [-0.43, 0.3]]), Wd * 0.82, glass,
+      { 1: glass, 2: glass, 3: def.roof, 4: def.roof, 5: glass, 6: glass, 7: glass, side: glass });
     // small ducktail spoiler
     box(-0.46 * Lx, 0, 0.035, Wd * 0.92, 0.245, 0.275, def.body);
     if (def.stripe) box(0.25 * Lx, 0, 0.2 * Lx, 0.05, 0.218, 0.232, def.stripe, def.stripe);
@@ -452,6 +452,7 @@ const THEMES = [
 let coinsDirty = false;
 let segs, car, cam, dist, pts, bonus, runCoins, curSeg, power, driftT, skids, parts, floats;
 let fallT, fallFromMenu, fallFront, fallGap, lastSkid, invuln, playTime, time = 0, respawnT = 0, airT = 0;
+let straightMode = false;
 let themeIdx = 0, pendingGap = 0, secType = 'normal', secLeft = 0;
 let state = 'menu';
 const GRAV = 14;
@@ -505,7 +506,7 @@ function sectionPiece(type, n, k, last) {
 function addSeg() {
   const n = segs.length, last = segs[n - 1];
   const k = Math.min(1, n / 220); // 0 → 1 difficulty
-  let dir = last ? 1 - last.dir : 0;
+  let dir = last && !straightMode ? 1 - last.dir : 0;
   let a = last ? { x: last.b.x, y: last.b.y } : { x: 1.4, y: 0 };
   let len, hw, landing = false;
   if (pendingGap > 0) {
@@ -514,6 +515,10 @@ function addSeg() {
     const D0 = DIRS[dir];
     a = { x: last.b.x + D0.x * pendingGap, y: last.b.y + D0.y * pendingGap };
     len = rand(7.5, 10); hw = Math.max(last.hw, 1.45 * TUNE.hw); landing = true;
+  } else if (straightMode) {
+    // menu screensaver: one endless straight, changing colour every few pieces
+    len = 10; hw = 1.9;
+    if (n > 0 && n % 3 === 0) themeIdx = (themeIdx + 1) % THEMES.length;
   } else if (n === 0) { len = 11; hw = 1.75; }
   else {
     if (secLeft-- <= 0) nextSection(k);
@@ -524,7 +529,7 @@ function addSeg() {
   const seg = { a, b, dir, len, hw, theme: themeIdx, coins: [], pow: null, bumps: [], ramp: false, flat: true, landing, extA: landing ? 0 : hw, extB: hw };
 
   // features
-  const featureOk = !landing && (secType === 'normal' || secType === 'wide' || secType === 'sweep');
+  const featureOk = !straightMode && !landing && (secType === 'normal' || secType === 'wide' || secType === 'sweep');
   if (featureOk && n > 8 && len >= 6.5 && !last.landing && Math.random() < 0.08 + 0.06 * k) {
     seg.ramp = true; seg.flat = false; seg.extB = 0;
   } else if (featureOk && n > 3 && len >= 6.6 && Math.random() < 0.3 + 0.17 * k) {
@@ -553,7 +558,7 @@ function addSeg() {
     const gap = Math.hypot(a.x - last.b.x, a.y - last.b.y);
     for (const f of [0.15, 0.5, 0.85]) seg.coins.push({ x: last.b.x + D.x * gap * f, y: last.b.y + D.y * gap * f, z: RAMP_H + 0.15 + Math.sin(f * Math.PI) * 0.35, got: false, air: true });
   }
-  if (n > 1 && len >= 3 && !seg.ramp) {
+  if (n > 1 && len >= 3 && !seg.ramp && !straightMode) {
     const px = -D.y, py = D.x; // perpendicular
     if (n > 6 && Math.random() < 0.08) {
       const t = len * 0.55;
@@ -571,7 +576,8 @@ function addSeg() {
   segs.push(seg);
 }
 
-function resetWorld() {
+function resetWorld(menu = false) {
+  straightMode = menu;
   segs = []; themeIdx = 0; pendingGap = 0; secType = 'normal'; secLeft = 5;
   for (let i = 0; i < 34; i++) addSeg();
   car = { x: 0, y: 0, z: 0, vz: 0, h: Math.PI, v: Math.PI, speed: 0, spin: 0, spinDir: 1, air: false, gh: 0 };
@@ -592,6 +598,7 @@ function findSeg(x, y) {
 
 // Autopilot used for the menu background
 function aiHold() {
+  if (straightMode) return false;
   const s = segs[curSeg], D = DIRS[s.dir], nxt = segs[curSeg + 1];
   const rem = (s.b.x - car.x) * D.x + (s.b.y - car.y) * D.y;
   if (rem < car.speed * (1.6 / TUNE.grip) + 0.3) return nxt.dir === 1;
@@ -734,7 +741,7 @@ function stepWorld(dt) {
     car.spin += car.spinDir * 5 * g;
     fallT += dt;
     if (fallT > 1.0) {
-      if (fallFromMenu) { resetWorld(); state = 'menu'; }
+      if (fallFromMenu) { resetWorld(true); state = 'menu'; }
       else if (power.shield) rescue();
       else gameOver();
     }
@@ -1046,7 +1053,7 @@ function gameOver() {
 
 function pauseGame() { if (state !== 'play') return; state = 'paused'; Sound.engine(0); Sound.screech(0); show('pause'); }
 function resumeGame() { if (state !== 'paused') return; state = 'play'; show(null); Sound.click(); }
-function toMenu() { persist(); Sound.click(); resetWorld(); state = 'menu'; show('menu'); }
+function toMenu() { persist(); Sound.click(); resetWorld(true); state = 'menu'; show('menu'); }
 
 function openShop(from) { Sound.init(); Sound.click(); shopReturn = from; buildShop(); show('shop'); }
 
@@ -1147,7 +1154,7 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 
-resetWorld();
+resetWorld(true);
 refreshToggles();
 show('menu');
 requestAnimationFrame(frame);
